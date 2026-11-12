@@ -952,19 +952,38 @@ static __global__ void flash_attn_tile(
 
     __syncthreads();
 
-    // Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+
+    // A KV tile whose mask is -inf for all Q columns of the block leaves KQ_max, KQ_sum and VKQ unchanged
+    // (scale expf(0) == 1, weights expf(-inf) == 0), so it can be skipped.
+    // This is the case for most of the cells of a sliding window cache.
+    const auto tile_is_masked = [&](const int k_VKQ_0) {
+        if (!maskh) {
+            return false;
+        }
+        bool unmasked = false;
+        for (int l = threadIdx.y*warp_size + threadIdx.x; l < ncols1*nbatch_fa; l += nwarps*warp_size) {
+            const int j = fastmodulo(col_Q_0 + l/nbatch_fa, ne01);
+            const int k = k_VKQ_0 + l % nbatch_fa;
+            unmasked = unmasked || (k < k_VKQ_max && !isinf(__half2float(maskh[j*stride_mask + k])));
+        }
+        return !__syncthreads_or(unmasked);
+    };
+
+    // Main loop over KV cache:
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            if (!tile_is_masked(k_VKQ_0)) {
+                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            }
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
-        if (k_VKQ_0 < k_VKQ_max) {
+        if (k_VKQ_0 < k_VKQ_max && !tile_is_masked(k_VKQ_0)) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
@@ -973,6 +992,9 @@ static __global__ void flash_attn_tile(
     } else {
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+            if (tile_is_masked(k_VKQ_0)) {
+                continue;
+            }
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
